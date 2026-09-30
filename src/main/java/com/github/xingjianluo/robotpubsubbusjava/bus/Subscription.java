@@ -10,13 +10,21 @@ import java.util.Map;
 /**
  * 单个订阅的运行时状态：
  * <ul>
- *   <li>pending：有界积压队列，达到上限时丢弃最旧消息并记录事件；</li>
+ *   <li>pending：有界积压队列，超限按订阅的 {@link BackpressurePolicy} 处理；</li>
  *   <li>unacked：已投递未确认消息及其确认截止时间，超时后重投；</li>
  *   <li>lastAckedSeq：累积确认位点，断线续传从该位点之后继续；</li>
- *   <li>consecutiveDrops：连续丢弃计数，超限则订阅被判定为慢消费者并断开。</li>
+ *   <li>consecutiveDrops：连续丢弃计数，DROP_OLDEST 策略下超限则订阅被摘除。</li>
  * </ul>
+ *
+ * <p>所有方法以订阅实例为锁串行化，并发发布/拉取/确认不会串位；
+ * 拉取等待只阻塞在自身监视器上，不影响其他会话与订阅。
  */
 final class Subscription {
+
+    /** 入队结果：兼容旧版 DropEvent，同时携带新版 BusEvent 列表。 */
+    record EnqueueResult(DropEvent dropEvent, List<BusEvent> events) {
+        static final EnqueueResult NONE = new EnqueueResult(null, List.of());
+    }
 
     /** 一次未确认投递的跟踪信息。 */
     private static final class InFlight {
@@ -33,6 +41,7 @@ final class Subscription {
 
     final String sessionId;
     final String topic;
+    final BackpressurePolicy policy;
 
     private final Deque<Message> pending = new ArrayDeque<>();
     private final Map<Long, InFlight> unacked = new LinkedHashMap<>();
@@ -40,55 +49,89 @@ final class Subscription {
     private int consecutiveDrops = 0;
     private boolean evicted = false;
 
-    Subscription(String sessionId, String topic) {
+    Subscription(String sessionId, String topic, BackpressurePolicy policy) {
         this.sessionId = sessionId;
         this.topic = topic;
+        this.policy = policy;
     }
 
-    boolean isEvicted() {
+    synchronized boolean isEvicted() {
         return evicted;
     }
 
-    long lastAckedSeq() {
+    synchronized long lastAckedSeq() {
         return lastAckedSeq;
     }
 
-    int pendingCount() {
+    synchronized int pendingCount() {
         return pending.size();
     }
 
     /**
-     * 入队新消息。积压满时丢弃队首（最旧）消息并返回对应丢弃事件；
-     * 连续丢弃达到上限时订阅被断开，返回断开事件。
+     * 入队新消息。{@code sessionRoom} 为会话级剩余容量（会话总上限减去当前各订阅积压之和），
+     * 实际可用空间取单订阅剩余与会话剩余的最小值；没有空间时按订阅背压策略处理。
      */
-    DropEvent enqueue(Message message, BusConfig config) {
-        if (evicted) {
-            return null;
+    synchronized EnqueueResult enqueue(Message message, BusConfig config, int sessionRoom) {
+        if (evicted || message.seq() <= lastAckedSeq) {
+            return EnqueueResult.NONE;
         }
-        if (message.seq() <= lastAckedSeq) {
-            return null; // 已确认位点之前的消息不再进入投递
-        }
-        if (pending.size() < config.maxBacklogPerSubscription()) {
+        int room = Math.min(config.maxBacklogPerSubscription() - pending.size(), sessionRoom);
+        if (room > 0) {
             pending.addLast(message);
-            return null;
+            notifyAll();
+            return EnqueueResult.NONE;
+        }
+        return overflow(message, config);
+    }
+
+    /** 积压/会话总量超限：按策略丢弃最旧或摘除订阅，并生成可区分事件。 */
+    private EnqueueResult overflow(Message message, BusConfig config) {
+        List<BusEvent> events = new ArrayList<>();
+        if (policy == BackpressurePolicy.EVICT_SUBSCRIPTION) {
+            evicted = true;
+            discardPendingAsGap(events);
+            events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
+                    "背压策略 EVICT_SUBSCRIPTION：触发超限的消息被丢弃"));
+            events.add(BusEvent.subscriptionEvicted(sessionId, topic,
+                    "背压策略 EVICT_SUBSCRIPTION：订阅被摘除，会话保留，重连后可续传"));
+            return new EnqueueResult(new DropEvent(sessionId, topic, message.seq(),
+                    DropReason.SLOW_CONSUMER_EVICTED,
+                    "背压策略 EVICT_SUBSCRIPTION：订阅被摘除"), events);
         }
         Message dropped = pending.pollFirst();
         consecutiveDrops++;
+        events.add(BusEvent.gap(sessionId, topic, dropped.seq(), dropped.seq(),
+                "积压达到上限，丢弃最旧消息"));
         if (consecutiveDrops >= config.maxDropsBeforeDisconnect()) {
             evicted = true;
-            pending.clear();
-            return new DropEvent(sessionId, topic, dropped.seq(),
+            discardPendingAsGap(events);
+            events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
+                    "订阅被摘除，新消息被丢弃"));
+            events.add(BusEvent.subscriptionEvicted(sessionId, topic,
+                    "连续丢弃 " + consecutiveDrops + " 条，订阅被摘除，会话保留，重连后可续传"));
+            return new EnqueueResult(new DropEvent(sessionId, topic, dropped.seq(),
                     DropReason.SLOW_CONSUMER_EVICTED,
-                    "连续丢弃 " + consecutiveDrops + " 条，订阅被断开");
+                    "连续丢弃 " + consecutiveDrops + " 条，订阅被断开"), events);
         }
         pending.addLast(message);
-        return new DropEvent(sessionId, topic, dropped.seq(),
+        notifyAll();
+        return new EnqueueResult(new DropEvent(sessionId, topic, dropped.seq(),
                 DropReason.BACKLOG_OVERFLOW,
-                "积压达到上限 " + config.maxBacklogPerSubscription() + "，丢弃最旧消息");
+                "积压达到上限 " + config.maxBacklogPerSubscription() + "，丢弃最旧消息"), events);
+    }
+
+    /** 摘除订阅时把仍积压的消息作为一段连续缺口丢弃。 */
+    private void discardPendingAsGap(List<BusEvent> events) {
+        if (!pending.isEmpty()) {
+            events.add(BusEvent.gap(sessionId, topic,
+                    pending.peekFirst().seq(), pending.peekLast().seq(),
+                    "订阅被摘除，积压消息被丢弃"));
+            pending.clear();
+        }
     }
 
     /** 收集已超时未确认、需要重投的消息（按序号升序）。 */
-    List<Message> dueRedeliveries(long nowMillis) {
+    synchronized List<Message> dueRedeliveries(long nowMillis) {
         List<Message> due = new ArrayList<>();
         for (InFlight inFlight : unacked.values()) {
             if (inFlight.deadlineMillis <= nowMillis) {
@@ -99,7 +142,7 @@ final class Subscription {
     }
 
     /** 取出最多 max 条待投递新消息（按序）。 */
-    List<Message> takePending(int max) {
+    synchronized List<Message> takePending(int max) {
         List<Message> out = new ArrayList<>(Math.min(max, pending.size()));
         while (!pending.isEmpty() && out.size() < max) {
             out.add(pending.pollFirst());
@@ -108,7 +151,7 @@ final class Subscription {
     }
 
     /** 记录一次投递：首次投递建立跟踪，重投刷新截止时间与次数。 */
-    void markDelivered(Message message, long nowMillis, long ackTimeoutMillis, boolean redelivery) {
+    synchronized void markDelivered(Message message, long nowMillis, long ackTimeoutMillis) {
         InFlight inFlight = unacked.get(message.seq());
         if (inFlight == null) {
             unacked.put(message.seq(), new InFlight(message, nowMillis + ackTimeoutMillis));
@@ -119,13 +162,13 @@ final class Subscription {
     }
 
     /** 当前投递次数（用于构造 Delivery.attempt）。 */
-    int attemptOf(long seq) {
+    synchronized int attemptOf(long seq) {
         InFlight inFlight = unacked.get(seq);
         return inFlight == null ? 0 : inFlight.attempt;
     }
 
     /** 累积确认：位点推进到 seq（含），清除对应未确认跟踪。 */
-    void ackUpTo(long seq) {
+    synchronized void ackUpTo(long seq) {
         if (seq > lastAckedSeq) {
             lastAckedSeq = seq;
         }
@@ -133,14 +176,45 @@ final class Subscription {
     }
 
     /** 订阅恢复投递（如重连后），清零连续丢弃计数。 */
-    void resetDrops() {
+    synchronized void resetDrops() {
         consecutiveDrops = 0;
     }
 
     /** 断连时将所有未确认投递置为立即到期，重连后优先重投。 */
-    void requeueInFlight() {
+    synchronized void requeueInFlight() {
         for (InFlight inFlight : unacked.values()) {
             inFlight.deadlineMillis = 0L;
+        }
+    }
+
+    /** 重连复活：解除摘除状态、清零丢弃计数、未确认消息置为待重投。 */
+    synchronized void revive() {
+        evicted = false;
+        consecutiveDrops = 0;
+        requeueInFlight();
+        notifyAll();
+    }
+
+    /** 是否有可投递内容（重投到期或有新消息）。 */
+    synchronized boolean hasDeliverable(long nowMillis) {
+        if (evicted) {
+            return false;
+        }
+        if (!pending.isEmpty()) {
+            return true;
+        }
+        for (InFlight inFlight : unacked.values()) {
+            if (inFlight.deadlineMillis <= nowMillis) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 在自身监视器上有界等待，只阻塞调用方线程。 */
+    synchronized void await(long millis) throws InterruptedException {
+        if (millis > 0) {
+            wait(millis);
         }
     }
 }

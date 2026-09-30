@@ -20,5 +20,13 @@ public enum ErrorCode {
     /** 订阅不存在 */
     SUBSCRIPTION_NOT_FOUND,
     /** 订阅已因慢消费者策略被断开 */
-    SUBSCRIPTION_EVICTED
+    SUBSCRIPTION_EVICTED,
+    /** 会话当前处于断线状态，发布/拉取等数据操作被挡住，需重连后继续 */
+    SESSION_DISCONNECTED,
+    /** 会话已被服务端关闭，不可再使用 */
+    SESSION_CLOSED,
+    /** 建会话请求未携带身份凭据 */
+    UNAUTHENTICATED,
+    /** 身份凭据非法或不被服务端认可 */
+    AUTHENTICATION_FAILED
 }
