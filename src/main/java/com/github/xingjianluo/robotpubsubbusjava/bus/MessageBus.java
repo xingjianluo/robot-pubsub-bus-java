@@ -11,6 +11,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * 本地发布/订阅消息总线。
  *
@@ -30,6 +33,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  */
 public class MessageBus {
+
+    private static final Logger log = LoggerFactory.getLogger(MessageBus.class);
 
     private static final class Session {
         final String id;
@@ -130,11 +135,16 @@ public class MessageBus {
         return openSession(authenticator.authenticate(credential));
     }
 
-    /** 断开会话：保留订阅状态与确认位点，未确认消息置为待重投；此后发布/拉取被挡住。 */
+    /**
+     * 断开会话：保留订阅状态与确认位点，未确认消息置为待重投；此后发布/拉取被挡住。
+     *
+     * <p>断线在各订阅监视器内逐一生效并唤醒等待中的拉取，与拉取线程
+     * “检查连接状态→进入等待”互斥，保证正在等待的那一次拉取也会被明确挡住。
+     */
     public void disconnect(String sessionId) {
         Session session = activeSession(sessionId);
         session.connected = false;
-        session.subscriptions.values().forEach(Subscription::requeueInFlight);
+        session.subscriptions.values().forEach(Subscription::markDisconnected);
     }
 
     /** 重连已存在的会话；未知会话以 SESSION_NOT_FOUND 拒绝；被摘除的订阅随重连复活续传。 */
@@ -149,6 +159,7 @@ public class MessageBus {
         Session session = activeSession(sessionId);
         session.connected = false;
         session.closed = true;
+        session.subscriptions.values().forEach(Subscription::markDisconnected);
         session.addEvent(BusEvent.sessionClosed(sessionId, "会话被服务端关闭"));
     }
 
@@ -199,16 +210,23 @@ public class MessageBus {
                 if (subscription == null) {
                     continue;
                 }
-                // 会话级总量检查与入队在会话锁内完成，并发发布不会突破总上限
-                Subscription.EnqueueResult result;
-                synchronized (subscriber) {
-                    int room = config.maxBacklogPerSession() - subscriber.totalPending();
-                    result = subscription.enqueue(message, config, Math.max(room, 0));
+                // 单个订阅者的背压处理/事件记录失败不得连累发布方与其他订阅者：
+                // 容量到顶是正常情况，必须按策略就地消化，发布照常返回序号
+                try {
+                    // 会话级总量检查与入队在会话锁内完成，并发发布不会突破总上限
+                    Subscription.EnqueueResult result;
+                    synchronized (subscriber) {
+                        int room = config.maxBacklogPerSession() - subscriber.totalPending();
+                        result = subscription.enqueue(message, config, Math.max(room, 0));
+                    }
+                    if (result.dropEvent() != null) {
+                        subscriber.dropEvents.add(result.dropEvent());
+                    }
+                    result.events().forEach(subscriber::addEvent);
+                } catch (RuntimeException e) {
+                    log.error("向会话 {} 的主题 {} 投递 seq={} 失败，已隔离，不影响其他订阅者",
+                            subscriber.id, topic, seq, e);
                 }
-                if (result.dropEvent() != null) {
-                    subscriber.dropEvents.add(result.dropEvent());
-                }
-                result.events().forEach(subscriber::addEvent);
             }
             return seq;
         }
@@ -226,14 +244,19 @@ public class MessageBus {
      * <p>{@code waitMillis} 允许调用方在没有可投递内容时有界等待，
      * 实际等待不超过 {@link BusConfig#maxPollWaitMillis}，且只阻塞在
      * 该订阅自身的监视器上，不会拖住其他会话或订阅。
+     *
+     * <p>等待期间会话被断开或关闭时，等待被立即唤醒并以
+     * {@link ErrorCode#SESSION_DISCONNECTED}/{@link ErrorCode#SESSION_CLOSED}
+     * 明确挡住，本次等待不会再返回任何消息（包括重投）；只有重连后才能继续收。
      */
     public List<Delivery> poll(String sessionId, String topic, int max, long waitMillis) {
-        Session session = connectedSession(sessionId);
+        Session session = activeSession(sessionId);
         Subscription subscription = subscription(session, topic);
-        requireNotEvicted(sessionId, topic, subscription);
         long budget = Math.min(Math.max(waitMillis, 0L), config.maxPollWaitMillis());
         long deadlineNanos = System.nanoTime() + budget * 1_000_000L;
         while (true) {
+            requireSessionUsable(session);
+            requireNotEvicted(sessionId, topic, subscription);
             List<Delivery> out = collect(session, subscription, max);
             if (!out.isEmpty() || budget <= 0L) {
                 return out;
@@ -243,12 +266,26 @@ public class MessageBus {
                 return out;
             }
             try {
-                subscription.await(remainingMillis);
+                // 条件检查（连接/摘除/有无可投递）与进入等待在订阅同一监视器内，
+                // 与 disconnect 的“置断线 + 唤醒”互斥，不会出现先判可等、
+                // 后被断线、却仍进入等待并在醒来后取走消息的窗口
+                subscription.awaitWhileWaitingAllowed(remainingMillis,
+                        () -> session.connected && !session.closed && !subscription.isEvicted());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return out;
             }
-            requireNotEvicted(sessionId, topic, subscription);
+        }
+    }
+
+    /** 会话必须存在、未关闭且处于连接状态；与 {@link #connectedSession} 相同的判定，供已取到会话的拉取循环复查。 */
+    private void requireSessionUsable(Session session) {
+        if (session.closed) {
+            throw new BusException(ErrorCode.SESSION_CLOSED, "会话 " + session.id + " 已被关闭");
+        }
+        if (!session.connected) {
+            throw new BusException(ErrorCode.SESSION_DISCONNECTED,
+                    "会话 " + session.id + " 处于断线状态，需重连后继续");
         }
     }
 

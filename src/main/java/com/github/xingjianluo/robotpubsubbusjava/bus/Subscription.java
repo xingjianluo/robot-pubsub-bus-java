@@ -6,6 +6,7 @@ import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
  * 单个订阅的运行时状态：
@@ -81,12 +82,26 @@ final class Subscription {
             notifyAll();
             return EnqueueResult.NONE;
         }
-        return overflow(message, config);
+        // sessionRoom 为 0 而本订阅尚有空间：容量是被同会话其他主题的积压占满的
+        boolean sessionCapacityExhausted = sessionRoom <= 0
+                && pending.size() < config.maxBacklogPerSubscription();
+        return overflow(message, config, sessionCapacityExhausted);
     }
 
-    /** 积压/会话总量超限：按策略丢弃最旧或摘除订阅，并生成可区分事件。 */
-    private EnqueueResult overflow(Message message, BusConfig config) {
+    /**
+     * 积压/会话总量超限：按策略丢弃最旧或摘除订阅，并生成可区分事件。
+     *
+     * <p>{@code sessionCapacityExhausted} 表示超限来自会话总上限而非本订阅积压：
+     * 此时本订阅的 pending 可能为空（容量被其他主题占满），DROP_OLDEST 不能去
+     * poll 空队列（否则 NPE），而是把触发超限的新消息自身记为一条缺口——
+     * 它对本订阅确实未投递，序号缺口必须完整对得上。
+     */
+    private EnqueueResult overflow(Message message, BusConfig config,
+                                   boolean sessionCapacityExhausted) {
         List<BusEvent> events = new ArrayList<>();
+        String dropContext = sessionCapacityExhausted
+                ? "会话总积压达到上限（容量被其他主题占用）"
+                : "积压达到上限";
         if (policy == BackpressurePolicy.EVICT_SUBSCRIPTION) {
             evicted = true;
             discardPendingAsGap(events);
@@ -100,24 +115,39 @@ final class Subscription {
         }
         Message dropped = pending.pollFirst();
         consecutiveDrops++;
-        events.add(BusEvent.gap(sessionId, topic, dropped.seq(), dropped.seq(),
-                "积压达到上限，丢弃最旧消息"));
+        if (dropped != null) {
+            events.add(BusEvent.gap(sessionId, topic, dropped.seq(), dropped.seq(),
+                    dropContext + "，丢弃最旧消息"));
+        } else {
+            // 本订阅无积压可丢（容量被同会话其他主题占满）：新消息自身成为缺口
+            events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
+                    dropContext + "，本订阅无积压可丢，新消息被丢弃"));
+        }
         if (consecutiveDrops >= config.maxDropsBeforeDisconnect()) {
             evicted = true;
             discardPendingAsGap(events);
-            events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
-                    "订阅被摘除，新消息被丢弃"));
+            if (dropped != null) {
+                // 常规丢弃只记了被丢的旧消息；新消息因订阅摘除同样无法入队，需补一条缺口
+                events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
+                        "订阅被摘除，新消息被丢弃"));
+            }
+            // dropped == null 时新消息的缺口已在上方记录，不重复记
             events.add(BusEvent.subscriptionEvicted(sessionId, topic,
                     "连续丢弃 " + consecutiveDrops + " 条，订阅被摘除，会话保留，重连后可续传"));
-            return new EnqueueResult(new DropEvent(sessionId, topic, dropped.seq(),
+            return new EnqueueResult(new DropEvent(sessionId, topic,
+                    dropped != null ? dropped.seq() : message.seq(),
                     DropReason.SLOW_CONSUMER_EVICTED,
                     "连续丢弃 " + consecutiveDrops + " 条，订阅被断开"), events);
         }
-        pending.addLast(message);
-        notifyAll();
-        return new EnqueueResult(new DropEvent(sessionId, topic, dropped.seq(),
+        if (dropped != null) {
+            pending.addLast(message);
+            notifyAll();
+        }
+        // dropped == null：新消息已作为缺口丢弃，不入队，会话总占用保持不变
+        return new EnqueueResult(new DropEvent(sessionId, topic,
+                dropped != null ? dropped.seq() : message.seq(),
                 DropReason.BACKLOG_OVERFLOW,
-                "积压达到上限 " + config.maxBacklogPerSubscription() + "，丢弃最旧消息"), events);
+                dropContext + "，按背压策略丢弃"), events);
     }
 
     /** 摘除订阅时把仍积压的消息作为一段连续缺口丢弃。 */
@@ -180,18 +210,21 @@ final class Subscription {
         consecutiveDrops = 0;
     }
 
-    /** 断连时将所有未确认投递置为立即到期，重连后优先重投。 */
-    synchronized void requeueInFlight() {
+    /** 断连时在订阅监视器内置未确认消息为立即到期并唤醒等待中的拉取，与拉取的“检查→等待”互斥。 */
+    synchronized void markDisconnected() {
         for (InFlight inFlight : unacked.values()) {
             inFlight.deadlineMillis = 0L;
         }
+        notifyAll();
     }
 
     /** 重连复活：解除摘除状态、清零丢弃计数、未确认消息置为待重投。 */
     synchronized void revive() {
         evicted = false;
         consecutiveDrops = 0;
-        requeueInFlight();
+        for (InFlight inFlight : unacked.values()) {
+            inFlight.deadlineMillis = 0L;
+        }
         notifyAll();
     }
 
@@ -211,9 +244,15 @@ final class Subscription {
         return false;
     }
 
-    /** 在自身监视器上有界等待，只阻塞调用方线程。 */
-    synchronized void await(long millis) throws InterruptedException {
-        if (millis > 0) {
+    /**
+     * 在自身监视器上有界等待；仅当 {@code waitingAllowed} 仍为 true 时才真正进入等待。
+     * 条件判断与 wait 在同一 synchronized 临界区，配合 {@link #markDisconnected()} 的
+     * notifyAll 构成标准守卫块：断线若发生在判断之前，本次不再等待；发生在等待期间，
+     * 等待被立即唤醒，由调用方在循环顶部复查连接状态后拒绝投递。
+     */
+    synchronized void awaitWhileWaitingAllowed(long millis, BooleanSupplier waitingAllowed)
+            throws InterruptedException {
+        if (millis > 0 && waitingAllowed.getAsBoolean()) {
             wait(millis);
         }
     }
