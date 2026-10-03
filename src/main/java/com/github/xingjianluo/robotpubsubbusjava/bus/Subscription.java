@@ -84,7 +84,13 @@ final class Subscription {
         return overflow(message, config);
     }
 
-    /** 积压/会话总量超限：按策略丢弃最旧或摘除订阅，并生成可区分事件。 */
+    /**
+     * 积压/会话总量超限：按策略丢弃最旧或摘除订阅，并生成可区分事件。
+     *
+     * <p>会话级总上限被其他订阅占满、本订阅积压为空时没有最旧可丢，
+     * 此时丢弃触发超限的新消息本身：容量到顶属于正常背压，入队必须正常返回，
+     * 不能以异常打断发布，也不能影响同一条消息对其他会话的投递。
+     */
     private EnqueueResult overflow(Message message, BusConfig config) {
         List<BusEvent> events = new ArrayList<>();
         if (policy == BackpressurePolicy.EVICT_SUBSCRIPTION) {
@@ -99,25 +105,39 @@ final class Subscription {
                     "背压策略 EVICT_SUBSCRIPTION：订阅被摘除"), events);
         }
         Message dropped = pending.pollFirst();
+        boolean droppedIncoming = dropped == null;
+        if (droppedIncoming) {
+            // 会话总上限被其他订阅占满、本订阅积压为空：丢弃新消息本身
+            dropped = message;
+        }
         consecutiveDrops++;
         events.add(BusEvent.gap(sessionId, topic, dropped.seq(), dropped.seq(),
-                "积压达到上限，丢弃最旧消息"));
+                droppedIncoming
+                        ? "会话总积压达到上限，本订阅无最旧可丢，丢弃新到消息"
+                        : "积压达到上限，丢弃最旧消息"));
         if (consecutiveDrops >= config.maxDropsBeforeDisconnect()) {
             evicted = true;
             discardPendingAsGap(events);
-            events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
-                    "订阅被摘除，新消息被丢弃"));
+            if (!droppedIncoming) {
+                // 新消息尚未入队即随摘除一并丢弃，缺口事件需覆盖其序号
+                events.add(BusEvent.gap(sessionId, topic, message.seq(), message.seq(),
+                        "订阅被摘除，新消息被丢弃"));
+            }
             events.add(BusEvent.subscriptionEvicted(sessionId, topic,
                     "连续丢弃 " + consecutiveDrops + " 条，订阅被摘除，会话保留，重连后可续传"));
             return new EnqueueResult(new DropEvent(sessionId, topic, dropped.seq(),
                     DropReason.SLOW_CONSUMER_EVICTED,
                     "连续丢弃 " + consecutiveDrops + " 条，订阅被断开"), events);
         }
-        pending.addLast(message);
-        notifyAll();
+        if (!droppedIncoming) {
+            pending.addLast(message);
+            notifyAll();
+        }
         return new EnqueueResult(new DropEvent(sessionId, topic, dropped.seq(),
                 DropReason.BACKLOG_OVERFLOW,
-                "积压达到上限 " + config.maxBacklogPerSubscription() + "，丢弃最旧消息"), events);
+                droppedIncoming
+                        ? "会话总积压达到上限，本订阅无最旧可丢，丢弃新到消息 " + message.seq()
+                        : "积压达到上限 " + config.maxBacklogPerSubscription() + "，丢弃最旧消息"), events);
     }
 
     /** 摘除订阅时把仍积压的消息作为一段连续缺口丢弃。 */
@@ -216,5 +236,10 @@ final class Subscription {
         if (millis > 0) {
             wait(millis);
         }
+    }
+
+    /** 唤醒正在等待的拉取（断线/关闭时调用），让等待方能立刻复查会话状态。 */
+    synchronized void wakeup() {
+        notifyAll();
     }
 }

@@ -130,11 +130,15 @@ public class MessageBus {
         return openSession(authenticator.authenticate(credential));
     }
 
-    /** 断开会话：保留订阅状态与确认位点，未确认消息置为待重投；此后发布/拉取被挡住。 */
+    /** 断开会话：保留订阅状态与确认位点，未确认消息置为待重投；此后发布/拉取被挡住，
+     *  正在等待中的拉取被唤醒并以 SESSION_DISCONNECTED 拒绝。 */
     public void disconnect(String sessionId) {
         Session session = activeSession(sessionId);
         session.connected = false;
-        session.subscriptions.values().forEach(Subscription::requeueInFlight);
+        session.subscriptions.values().forEach(subscription -> {
+            subscription.requeueInFlight();
+            subscription.wakeup();
+        });
     }
 
     /** 重连已存在的会话；未知会话以 SESSION_NOT_FOUND 拒绝；被摘除的订阅随重连复活续传。 */
@@ -144,11 +148,13 @@ public class MessageBus {
         session.subscriptions.values().forEach(Subscription::revive);
     }
 
-    /** 关闭会话：终态，不可再重连；事件队列保留 SESSION_CLOSED 供客户端最后读取。 */
+    /** 关闭会话：终态，不可再重连；事件队列保留 SESSION_CLOSED 供客户端最后读取，
+     *  正在等待中的拉取被唤醒并以 SESSION_CLOSED 拒绝。 */
     public void closeSession(String sessionId) {
         Session session = activeSession(sessionId);
         session.connected = false;
         session.closed = true;
+        session.subscriptions.values().forEach(Subscription::wakeup);
         session.addEvent(BusEvent.sessionClosed(sessionId, "会话被服务端关闭"));
     }
 
@@ -226,6 +232,11 @@ public class MessageBus {
      * <p>{@code waitMillis} 允许调用方在没有可投递内容时有界等待，
      * 实际等待不超过 {@link BusConfig#maxPollWaitMillis}，且只阻塞在
      * 该订阅自身的监视器上，不会拖住其他会话或订阅。
+     *
+     * <p>等待期间会话被断开/关闭的，等待被立即打断并以
+     * {@link ErrorCode#SESSION_DISCONNECTED}/{@link ErrorCode#SESSION_CLOSED}
+     * 拒绝：断线生效后任何拉取（含重投消息）都不会再返回，
+     * 只有重连成功之后才能继续收。
      */
     public List<Delivery> poll(String sessionId, String topic, int max, long waitMillis) {
         Session session = connectedSession(sessionId);
@@ -234,6 +245,8 @@ public class MessageBus {
         long budget = Math.min(Math.max(waitMillis, 0L), config.maxPollWaitMillis());
         long deadlineNanos = System.nanoTime() + budget * 1_000_000L;
         while (true) {
+            // 每一轮（含等待被唤醒后）都先复查会话状态：断线生效后不再返回任何消息
+            requireConnected(session);
             List<Delivery> out = collect(session, subscription, max);
             if (!out.isEmpty() || budget <= 0L) {
                 return out;
@@ -339,11 +352,19 @@ public class MessageBus {
     /** 会话必须存在、未关闭且处于连接状态；断线会话的数据操作被明确挡住。 */
     private Session connectedSession(String sessionId) {
         Session session = activeSession(sessionId);
+        requireConnected(session);
+        return session;
+    }
+
+    /** 等待中的拉取每轮复查用：断线/关闭立即以可区分错误拒绝。 */
+    private void requireConnected(Session session) {
+        if (session.closed) {
+            throw new BusException(ErrorCode.SESSION_CLOSED, "会话 " + session.id + " 已被关闭");
+        }
         if (!session.connected) {
             throw new BusException(ErrorCode.SESSION_DISCONNECTED,
-                    "会话 " + sessionId + " 处于断线状态，需重连后继续");
+                    "会话 " + session.id + " 处于断线状态，需重连后继续");
         }
-        return session;
     }
 
     private Subscription subscription(Session session, String topic) {

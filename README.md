@@ -56,11 +56,20 @@ mvn spring-boot:run
 
 连续的丢弃会合并为一段缺口，例如 `GAP [2,6]` 表示 seq 2 到 6 全部丢失。
 
+**缺口事件与重连续传的一致性**：容量超限丢了多少、丢了哪些序号，由 `GAP` 事件完整反映，
+不多一条不少一条——每条被丢弃的序号要么被投递、要么出现在缺口中（并发测试逐条核对这一
+不变量）。订阅被摘除时已确认位点保留：重连后已确认的不重复交付、被丢弃的不补发（客户端
+从缺口事件得知），只从确认位点之后继续收新消息。
+
 ## 重连与断线规则
 
 - `disconnect` 断开会话时保留全部订阅状态与确认位点，并将未确认消息置为待重投。
 - **断线真正生效**：断线后该会话的发布、拉取、确认、订阅均被 `SESSION_DISCONNECTED` 明确挡住，
   只有重连回来才能继续，不会出现断线了还能拉到消息的情况。
+- **断线对正在等待的拉取同样生效**：带 `waitMillis` 的拉取在等待期间遇到会话断线/关闭的，
+  会被立即唤醒并以 `SESSION_DISCONNECTED` / `SESSION_CLOSED` 拒绝——等待结束后也不会把消息
+  （含被置为待重投的消息）返回给已断线的会话；等待期间新到达的消息同样唤不醒一次"成功"的拉取。
+  只有 `reconnect` 成功之后才能继续收。
 - `reconnect` 以原会话标识恢复会话，从已确认位点之后继续投递：
   未确认消息以 `redelivered=true` 优先重投，随后按序投递新消息；
   因背压被摘除的订阅随重连复活（确认位点保留）。
@@ -72,6 +81,12 @@ mvn spring-boot:run
 - 每个订阅的积压队列有界（`bus.max-backlog-per-subscription`）。
 - **会话级总量上限**：单会话全部订阅积压之和受 `bus.max-backlog-per-session` 约束，
   不随订阅主题数无界增长；多主题同时积压也不能突破总量。
+- **会话总量在多主题下的实际行为**：会话总量被占满时，新消息能否入队取决于目标订阅自己
+  还有没有剩余空间。若目标订阅积压为空（总量被同一会话的其他订阅占满），没有"最旧"可丢，
+  此时容量到顶按该订阅的背压策略正常处理：`DROP_OLDEST` 丢弃这条新到消息本身并产生
+  `GAP` 事件；`EVICT_SUBSCRIPTION` 直接摘除该订阅。**发布始终正常返回**（HTTP 200），
+  不会因为容量到顶抛出服务端内部错误；某一会话超限只影响它自己的投递，同一条消息对其他
+  会话订阅者的投递不被掐断，主题序号也不会因此出现额外空洞。
 - 超限时的处理**按订阅选择**（订阅时指定 `policy`）：
   - `DROP_OLDEST`（默认）：丢弃最旧消息为新消息腾位，产生 `GAP` 事件；
     连续丢弃达到 `bus.max-drops-before-disconnect` 次后订阅被摘除。
@@ -128,6 +143,9 @@ mvn spring-boot:run
 - 至少一次、会话内有序、累积确认、首投/重投可区分的语义不变。
 - 一处行为收紧：断线会话的发布/拉取/确认/订阅现在会被 `SESSION_DISCONNECTED` 明确拒绝
   （此前只是记录状态）；订阅被摘除后重连可复活续传（此前永久拒绝）。
+- 两处边界修正：断线时正在等待中的拉取被立即唤醒并拒绝（此前等待结束后仍会返回消息，
+  含重投消息）；会话总上限被同会话其他订阅占满、目标订阅积压为空时，按该订阅的背压策略
+  正常丢弃/摘除且发布正常返回（此前抛出服务端内部错误，HTTP 500，并连累同主题其他订阅者）。
 
 ## 本地验证
 
@@ -143,9 +161,27 @@ mvn test
   与各类失败的可区分错误码；
 - `AuthenticationTest`：凭据由服务端核验，未携带/非法凭据与越权、未知主题可区分；
 - `DisconnectEnforcementTest`：断线后发布/拉取被明确挡住，重连恢复；
+- `DisconnectWaitingPollTest`：断线对正在等待中的拉取生效——等待被立即打断并以
+  `SESSION_DISCONNECTED` 拒绝（含重投消息与等待期间新到达的消息），重连后才能继续收；
 - `DeliveryEventsTest`：DELIVERED / GAP（缺失序号缺口）/ SUBSCRIPTION_EVICTED / SESSION_CLOSED 可区分；
 - `BackpressurePolicyTest`：按订阅选择背压策略，摘除后会话保留并重连续传；
 - `SessionCapacityTest`：会话级总量上限跨主题生效，多主题积压不突破总量；
-- `ConcurrencyTest`：并发发布/拉取/确认不串位，慢会话有界等待不拖住他人；
+- `SharedSessionCapOverflowTest`：多订阅共享会话总上限——一个主题占满总量、另一个订阅为空时
+  继续发布：DROP_OLDEST 丢弃新到消息、EVICT_SUBSCRIPTION 摘除订阅，发布正常返回、其他会话
+  投递不受影响，缺口事件完整反映丢弃序号，摘除后重连从已确认位点续传；
+- `SharedSessionCapApiTest`：上述场景在 HTTP 入口的回归——发布返回 200 而非 500
+  （用 `bus.max-backlog-per-session=4` 等小上限覆盖默认配置复现）；
+- `ConcurrencyTest`：并发发布/拉取/确认不串位，多主题共享会话总量时积压峰值不超上限、
+  每条序号要么被投递要么在缺口中，慢会话有界等待不拖住他人；
 - 回归：`ReconnectResumeTest`（断线重连续传）、`RedeliveryTest`（超时重投）、
   `AuthorizationTest`（越权与失败语义）、`SlowConsumerTest`（慢消费者隔离）。
+
+### 本地复现两类边界场景
+
+- **会话总上限被单主题占满后向空订阅发布**：运行
+  `mvn test -Dtest=SharedSessionCapOverflowTest,SharedSessionCapApiTest`，
+  日志中 `[背压]`/`[缺口事件]`/`[摘除]` 行展示丢弃的序号、事件内容与其他会话的正常投递。
+- **断线拦截正在等待的拉取**：运行 `mvn test -Dtest=DisconnectWaitingPollTest`，
+  日志中 `[拦截]` 行展示等待中的拉取在断线后多少毫秒内被拒绝，`[重连]` 行展示续传。
+- **并发交错**：运行 `mvn test -Dtest=ConcurrencyTest`，日志中 `[并发]` 行展示
+  两主题并发下会话总积压峰值（不超上限）。
